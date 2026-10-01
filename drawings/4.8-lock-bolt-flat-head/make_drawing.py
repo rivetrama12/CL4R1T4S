@@ -1,16 +1,15 @@
 #!/usr/bin/env python3
-"""Nominal section of 4.8 Lock Bolt Flat Head, measured from the 3DXML solid.
+"""Nominal section of 4.8 Lock Bolt Flat Head, measured from the STEP solid.
 
-The 3DXML stores one axisymmetric solid (CATIA analytic surfaces). No PMI,
-tolerances, material, or finish. Model axis is Y, millimetres. Datum A is the
-head top face (Y = 0). Positive Y runs toward the tail, left to right here.
+The STEP file stores one axisymmetric solid. No PMI, tolerances, material, or
+finish. Model axis is Y, millimetres. Datum A is the head top face (Y = 0).
+Positive Y runs toward the tail, left to right here.
 """
 
 from __future__ import annotations
 
 import math
-import struct
-import zipfile
+import re
 from pathlib import Path
 
 import matplotlib
@@ -22,7 +21,7 @@ from matplotlib.backends.backend_pdf import PdfPages
 from matplotlib.patches import Circle, Polygon, Rectangle
 
 ROOT = Path(__file__).resolve().parent
-XML_PATH = ROOT / "4.8_Lock_Bolt_Flat_Head.3dxml"
+STEP_PATH = ROOT / "4.8_Lock_Bolt_Flat_Head.step"
 OUT_PATH = ROOT / "4.8_Lock_Bolt_Flat_Head_DIMENSIONS.pdf"
 PREVIEW = ROOT / "preview" / "01-lock-bolt.png"
 
@@ -94,65 +93,22 @@ class View:
         return f"SCALE {self.s:.1f} : 1"
 
 
-def _nice_doubles(buf: bytes, start: int, end: int, limit: int = 12):
-    out = []
-    i = start
-    while i < end - 8 and len(out) < limit:
-        v = struct.unpack_from(">d", buf, i)[0]
-        exp = buf[i]
-        ok = math.isfinite(v) and abs(v) < 1e4 and exp in (
-            0x00, 0x80, 0x3C, 0x3D, 0x3E, 0x3F, 0x40, 0x41, 0x42,
-            0xBC, 0xBD, 0xBE, 0xBF, 0xC0, 0xC1, 0xC2,
-        )
-        if ok and (abs(v) < 1e-9 or abs(v) > 1e-4):
-            out.append(v)
-            i += 8
-        else:
-            i += 1
-    return out
-
-
-def _rep_bytes() -> bytes:
-    with zipfile.ZipFile(XML_PATH) as zf:
-        name = next(n for n in zf.namelist() if n.endswith(".3DRep"))
-        return zf.read(name)
-
-
-def assert_model(blob: bytes) -> None:
-    """The drawing numbers have to be the edges stored in the 3DRep."""
-    tags = []
-    idx = 0
-    while True:
-        i = blob.find(b"\x00\x34", idx)
-        if i < 0 or i + 2 >= len(blob):
-            break
-        if blob[i + 2] == 0x36 and i >= 2:
-            tags.append(i - 2)
-        idx = i + 1
-    lines = []
-    for n, p in enumerate(tags):
-        end = tags[n + 1] if n + 1 < len(tags) else p + 90
-        vals = _nice_doubles(blob, p + 5, end, 6)
-        if len(vals) < 6:
-            continue
-        # Each generator is two XYZ points. Radius is off the Y axis.
-        r0 = math.hypot(vals[0], vals[2])
-        r1 = math.hypot(vals[3], vals[5])
-        lines.append((r0, vals[1], r1, vals[4]))
-    expect = [
-        (R_HEAD, Y_LAND, R_HEAD, Y_SHOULDER),
-        (R_SHANK, Y_SHOULDER, R_SHANK, Y_TAPER),
-        (R_TAIL, Y_TAIL, R_TAIL, Y_END),
-        (R_SHANK, Y_TAPER, R_TAIL, Y_TAIL),
-    ]
-
-    def close(a, b):
-        return all(abs(x - y) < 1e-6 for x, y in zip(a, b))
-
-    for exp in expect:
-        flipped = (exp[2], exp[3], exp[0], exp[1])
-        if not any(close(exp, ln) or close(flipped, ln) for ln in lines):
-            raise SystemExit(f"3DXML edge missing: {exp}")
+def assert_model(text: str) -> None:
+    """The drawing numbers have to be the surfaces stored in the STEP file."""
+    if "SI_UNIT(.MILLI.,.METRE.)" not in text and "SI_UNIT ( .MILLI. , .METRE. )" not in text:
+        raise SystemExit("STEP length unit is not millimetres")
+    cyl = {float(v) for v in re.findall(r"CYLINDRICAL_SURFACE\('',#\d+,([0-9.]+)\)", text)}
+    if cyl != {R_HEAD, R_SHANK, R_TAIL}:
+        raise SystemExit(f"cylinder radii {cyl}")
+    tori = re.findall(r"TOROIDAL_SURFACE\('',#\d+,([0-9.]+),([0-9.]+)\)", text)
+    if tori != [(f"{R_FLAT:g}", f"{R_FILLET:g}")]:
+        raise SystemExit(f"torus {tori}")
+    cones = re.findall(r"CONICAL_SURFACE\('',#\d+,([0-9.]+),([0-9.eE+-]+)\)", text)
+    if len(cones) != 1:
+        raise SystemExit(f"cone count {len(cones)}")
+    radius, angle = float(cones[0][0]), float(cones[0][1])
+    if abs(radius - R_SHANK) > 1e-9 or abs(angle - math.radians(TAPER_DEG)) > 1e-9:
+        raise SystemExit(f"cone {radius} {angle}")
     if abs((R_SHANK - R_TAIL) * math.sqrt(3) - (Y_TAIL - Y_TAPER)) > 1e-9:
         raise SystemExit("taper is not 30 degrees from the axis")
 
@@ -397,7 +353,7 @@ def segment_rows():
 
 
 def main():
-    assert_model(_rep_bytes())
+    assert_model(STEP_PATH.read_text())
     pts = profile()
     fig, ax = new_page()
     frame(ax)
@@ -418,8 +374,8 @@ def main():
         title="PROFILE, HEAD TO TAIL",
     )
     T(ax, 230, 214, "Angle is from datum B.  30° from the axis is 60° included.", size=5.3, color=MUTED, va="top")
-    T(ax, 230, 208, "The 3DXML name is 4.8. The solid measures Ø4.900 on the shank.", size=5.3, color=MUTED, va="top")
-    T(ax, 12, 14, "NOMINAL GEOMETRY FROM THE 3DXML.   NO PMI, TOLERANCES, OR MATERIAL ARE STORED.", size=5.2, color=MUTED, va="center", z=7)
+    T(ax, 230, 208, "The part is named 4.8. The solid measures Ø4.900 on the shank.", size=5.3, color=MUTED, va="top")
+    T(ax, 12, 14, "NOMINAL GEOMETRY FROM THE STEP FILE.   NO PMI, TOLERANCES, OR MATERIAL ARE STORED.", size=5.2, color=MUTED, va="center", z=7)
     PREVIEW.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(PREVIEW)
     with PdfPages(OUT_PATH) as pdf:
